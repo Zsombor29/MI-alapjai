@@ -1,6 +1,8 @@
 ﻿.venv/
-venv/
 __pycache__/
 *.py[cod]
 .env
 outputs/
+models/
+weights/
+*.pt
