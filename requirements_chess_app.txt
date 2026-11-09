@@ -1,0 +1,15 @@
+streamlit>=1.39
+opencv-python>=4.9
+numpy>=1.26
+python-chess>=1.999
+Pillow>=10
+transformers>=4.45
+accelerate>=0.34
+safetensors>=0.4
+huggingface_hub>=0.28
+timm>=1.0
+torchvision>=0.19
+ultralytics>=8.3
+# PyTorch is required by ChessSight RT-DETR and its Swin corner model.
+# It is normally already installed in this project's .venv; avoid reinstalling
+# it automatically because the Windows wheel is large and CUDA variants differ.

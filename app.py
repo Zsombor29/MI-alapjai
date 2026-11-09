@@ -1,10 +1,13 @@
 """Automatic chessboard photo -> digital position/FEN.
 
-Version 2.0
-- Uses ChessSight RT-DETR as the primary pretrained piece detector.
-- Finds board corners automatically: OpenCV checker-grid detection first,
-  the detector's corner proposals second, and the older photochess pose model
-  as a final learned fallback. There is no manual corner selection.
+Version 7.0
+- Restores ChessSight RT-DETR as the PRIMARY piece classifier (the better-performing
+  model from the previous version).
+- Removes the per-square ONNX piece classifier from the decision path.
+- Uses ChessSight's dedicated Swin corner-heatmap model for automatic board geometry,
+  with OpenCV and the older pose model as fallbacks.
+- Uses the upstream ChessSight three-pass recipe: full frame, square board crop,
+  and mirrored crop, with weighted per-square score fusion.
 
 Run with:
     .\\.venv\\Scripts\\python.exe -m streamlit run app.py
@@ -30,6 +33,8 @@ MODEL_DIR = ROOT / "models"
 POSE_CORNER_PATH = MODEL_DIR / "photochess_corner.pt"
 POSE_CORNER_URL = "https://raw.githubusercontent.com/2T1F/photochess/main/corner.pt"
 CHESSSIGHT_ID = "tchauffi/chesssight-rtdetr-v0.2.0"
+CORNER_MODEL_ID = "tchauffi/chesssight-corner-heatmap-v1"
+CORNER_MIN_SCORE = 0.30
 BOARD_SIZE = 800
 # Published calibration from the ChessSight v0.2.0 model card.
 CALIBRATION_SCALE = 2.9502
@@ -125,7 +130,9 @@ def run_chesssight(image_bgr: np.ndarray, processor, model, device) -> tuple[lis
         label = id2label.get(label_index, id2label.get(str(label_index), str(label_index)))
         label = normalise_label(label)
         xyxy = box.detach().cpu().numpy().astype(float).tolist()
-        if calibrated < 0.02:
+        # Keep low-scoring runner-up class proposals for score diagnostics and
+        # per-square second opinions. They never override the top fused score.
+        if calibrated < 0.001:
             continue
         x1, y1, x2, y2 = xyxy
         all_dets.append({"label": label, "score": calibrated, "raw_score": raw_score,
@@ -134,16 +141,34 @@ def run_chesssight(image_bgr: np.ndarray, processor, model, device) -> tuple[lis
     return all_dets, pieces
 
 
+@st.cache_data(show_spinner=False, max_entries=24)
+def cached_chesssight_image(image_png: bytes):
+    """Cache detections by image bytes so repeated clicks give the same outputs."""
+    image_array = np.frombuffer(image_png, dtype=np.uint8)
+    image_bgr = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+    if image_bgr is None:
+        raise RuntimeError("Nem sikerült dekódolni a modell bemeneti képét.")
+    processor, model, device = load_chesssight_model()
+    all_dets, pieces = run_chesssight(image_bgr, processor, model, device)
+    return all_dets, pieces
+
+
+def detect_cached(image_bgr: np.ndarray):
+    ok, encoded = cv2.imencode(".png", image_bgr)
+    if not ok:
+        raise RuntimeError("Nem sikerült előkészíteni a képet a felismeréshez.")
+    return cached_chesssight_image(encoded.tobytes())
+
+
 def order_corners(points: np.ndarray) -> np.ndarray:
-    """Return TL, TR, BR, BL in image coordinates."""
+    """Order four corners clockwise, starting at the visually top-left corner."""
     points = np.asarray(points, dtype=np.float32).reshape(4, 2)
-    center = points.mean(axis=0)
-    angles = np.arctan2(points[:, 1] - center[1], points[:, 0] - center[0])
+    centre = points.mean(axis=0)
+    angles = np.arctan2(points[:, 1] - centre[1], points[:, 0] - centre[0])
     ordered = points[np.argsort(angles)]
-    first = int(np.argmin(ordered[:, 0] + ordered[:, 1]))
-    ordered = np.roll(ordered, -first, axis=0)
-    # If it is not convex, caller should reject it.
-    return ordered.astype(np.float32)
+    top_left_reference = np.array([points[:, 0].min(), points[:, 1].min()], dtype=np.float32)
+    first = int(np.argmin(np.linalg.norm(ordered - top_left_reference, axis=1)))
+    return np.roll(ordered, -first, axis=0).astype(np.float32)
 
 
 def quad_area(points: np.ndarray) -> float:
@@ -396,8 +421,67 @@ def detect_corners_from_pose_model(image_bgr: np.ndarray, board_bbox=None) -> np
     return best_quad_from_candidates(points, scores, image_bgr.shape, board_bbox)
 
 
+@st.cache_resource(show_spinner=False)
+def load_chesssight_corner_model():
+    """Load the dedicated ChessSight Swin-T corner heatmap model from Hugging Face."""
+    import importlib.util
+    import sys
+    import torch
+    from huggingface_hub import snapshot_download
+
+    model_dir = Path(snapshot_download(
+        repo_id=CORNER_MODEL_ID,
+        allow_patterns=["config.json", "model.safetensors", "modeling_corner_heatmap.py"],
+    ))
+    module_path = model_dir / "modeling_corner_heatmap.py"
+    if not module_path.is_file():
+        raise RuntimeError(f"Hiányzik a sarokmodell kódja: {module_path}")
+
+    module_name = "_chesssight_corner_heatmap_v1"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Nem sikerült betölteni a ChessSight sarokmodell modulját.")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, config = module.load_corner_model(model_dir, device=device)
+    return module, model, config, device
+
+
+def detect_corners_from_heatmap(image_bgr: np.ndarray) -> np.ndarray | None:
+    """Use the model author's dedicated Swin heatmap model to predict all four corners."""
+    from PIL import Image
+
+    module, model, config, device = load_chesssight_corner_model()
+    rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    pil_image = Image.fromarray(rgb)
+    quad = module.predict_quad(
+        model, pil_image, config, device=device, min_score=CORNER_MIN_SCORE
+    )
+    if quad is None:
+        return None
+    quad = order_corners(np.asarray(quad, dtype=np.float32))
+    h, w = image_bgr.shape[:2]
+    if not _quad_geometry_ok(quad, w, h):
+        return None
+    return quad
+
+
 def detect_board_corners(image_bgr: np.ndarray, detections: list[dict[str, Any]]) -> tuple[np.ndarray, str]:
     board_bbox = get_board_bbox(detections)
+    # Primary corner model: trained specifically for chessboard geometry.
+    heatmap_error = None
+    try:
+        quad = detect_corners_from_heatmap(image_bgr)
+        if quad is not None:
+            return quad, "ChessSight Swin corner heatmap v1"
+    except Exception as exc:
+        heatmap_error = str(exc)
+
+    # Independent fallbacks are retained in case the heatmap model cannot load
+    # or the photograph is outside its training distribution.
     quad, method = detect_corners_from_checker_grid(image_bgr, board_bbox)
     if quad is not None:
         return quad, method
@@ -407,11 +491,13 @@ def detect_board_corners(image_bgr: np.ndarray, detections: list[dict[str, Any]]
     quad = detect_corners_from_pose_model(image_bgr, board_bbox)
     if quad is not None:
         return quad, "fallback photochess pose model"
+    detail = f" A ChessSight sarokmodell jelzése: {heatmap_error}" if heatmap_error else ""
     raise RuntimeError(
         "Nem sikerült automatikusan meghatározni a sakktábla négy sarkát. "
-        "A program már több módszert kipróbált (OpenCV rácsdetektálás, ChessSight sarokjelöltek, "
-        "fallback pose-modell). Készíts olyan képet, amelyen a teljes 8×8-as rács élesen látszik, "
-        "és a tábla nincs erősen levágva. Kézi sarokkijelölést nem kérünk."
+        "A program kipróbálta a ChessSight Swin sarokmodellt, az OpenCV rácsdetektálást, "
+        "a detektor sarokjavaslatait és a photochess tartalékmodellt. "
+        "Készíts olyan képet, amelyen a teljes tábla és mind a négy sarka látszik. "
+        "Kézi sarokkijelölést nem kérünk." + detail
     )
 
 
@@ -456,92 +542,377 @@ def draw_original(image_bgr: np.ndarray, corners: np.ndarray, detections: list[d
     return view
 
 
-def run_recognition(image_bgr: np.ndarray, processor, model, device):
-    all_dets, piece_dets = run_chesssight(image_bgr, processor, model, device)
-    corners, corner_method = detect_board_corners(image_bgr, all_dets)
-    dest = np.array([[0, 0], [BOARD_SIZE - 1, 0], [BOARD_SIZE - 1, BOARD_SIZE - 1], [0, BOARD_SIZE - 1]], dtype=np.float32)
-    H = cv2.getPerspectiveTransform(order_corners(corners).astype(np.float32), dest)
-    rectified = cv2.warpPerspective(image_bgr, H, (BOARD_SIZE, BOARD_SIZE), flags=cv2.INTER_CUBIC)
+# ChessSight's published board reader uses the contact point near the bottom
+# of the detection box, not the box centre or the exact lower edge.
+FOOT_X = 0.50
+FOOT_Y = 0.96
+POSITION_THRESHOLD = 0.08
+CANDIDATE_FLOOR = 0.01
+CROP_SIDE_MARGIN = 0.10
+CROP_TOP_MARGIN = 0.30
 
-    size = BOARD_SIZE / 8.0
-    candidates: list[dict[str, Any]] = []
-    for det in piece_dets:
-        x1, y1, x2, y2 = det["box"]
-        # Piece-to-square anchor: bottom-centre is more stable than the visual centre of tall pieces.
-        foot = np.array([[[0.5 * (x1 + x2), y2]]], dtype=np.float32)
-        warped = cv2.perspectiveTransform(foot, H).reshape(2)
-        x, y = float(warped[0]), float(warped[1])
-        if not (0 <= x < BOARD_SIZE and 0 <= y < BOARD_SIZE):
+
+def _board_crop(corners: np.ndarray, width: int, height: int) -> tuple[int, int, int]:
+    """Square crop around the board, leaving extra room above the far rank."""
+    points = np.asarray(corners, dtype=np.float64)
+    x0, x1 = float(points[:, 0].min()), float(points[:, 0].max())
+    y0, y1 = float(points[:, 1].min()), float(points[:, 1].max())
+    bw, bh = x1 - x0, y1 - y0
+    x0 -= CROP_SIDE_MARGIN * bw
+    x1 += CROP_SIDE_MARGIN * bw
+    y0 -= CROP_TOP_MARGIN * bh
+    y1 += CROP_SIDE_MARGIN * bh
+    side = int(round(min(max(x1 - x0, y1 - y0), width, height)))
+    side = max(32, side)
+    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    left = int(round(min(max(cx - side / 2.0, 0), max(0, width - side))))
+    top = int(round(min(max(cy - side / 2.0, 0), max(0, height - side))))
+    return left, top, side
+
+
+def _square_scores(
+    detections: list[dict[str, Any]],
+    image_to_board: np.ndarray,
+    *,
+    offset_x: float = 0.0,
+    offset_y: float = 0.0,
+    mirror_side: float | None = None,
+) -> dict[tuple[int, int, str], float]:
+    """Return the strongest proposal for every (square, class) in one view."""
+    scores: dict[tuple[int, int, str], float] = {}
+    square_size = BOARD_SIZE / 8.0
+    for det in detections:
+        label = str(det.get("label", ""))
+        letter = FEN_MAP.get(label)
+        if letter is None:
             continue
-        col = min(7, int(x // size))
-        row = min(7, int(y // size))
-        candidates.append({**det, "row": row, "col": col, "xy": (x, y)})
+        x1, y1, x2, y2 = [float(v) for v in det["box"]]
+        # Undo a horizontal mirror before shifting the crop back into the photo.
+        if mirror_side is not None:
+            x1, x2 = mirror_side - x2, mirror_side - x1
+        x1 += offset_x; x2 += offset_x
+        y1 += offset_y; y2 += offset_y
+        px = x1 + FOOT_X * (x2 - x1)
+        py = y1 + FOOT_Y * (y2 - y1)
+        point = cv2.perspectiveTransform(
+            np.asarray([[[px, py]]], dtype=np.float32), image_to_board
+        )[0, 0]
+        bx, by = float(point[0]), float(point[1])
+        if not (0.0 <= bx < BOARD_SIZE and 0.0 <= by < BOARD_SIZE):
+            continue
+        col = min(7, int(bx // square_size))
+        row = min(7, int(by // square_size))
+        key = (row, col, letter)
+        scores[key] = max(scores.get(key, 0.0), float(det["score"]))
+    return scores
 
-    if not candidates:
-        raise RuntimeError("A bábufelismerő nem talált olyan bábut, amely a felismert tábla területére esik.")
 
-    # Keep the best detection per square; this is intentionally recall-oriented as the model card recommends.
-    best: dict[tuple[int, int], dict[str, Any]] = {}
-    for det in candidates:
-        key = (det["row"], det["col"])
-        if key not in best or det["score"] > best[key]["score"]:
-            best[key] = det
-    # A normal chess position has at most 32 pieces on the board. Drop the weakest spill-over detections.
-    if len(best) > 32:
-        keep_keys = {key for key, _ in sorted(best.items(), key=lambda item: item[1]["score"], reverse=True)[:32]}
-        best = {key: val for key, val in best.items() if key in keep_keys}
+def _fuse_square_scores(
+    passes: list[tuple[dict[tuple[int, int, str], float], float]]
+) -> dict[tuple[int, int, str], float]:
+    """Weighted mean; a class missing from a pass receives zero in that pass."""
+    total_weight = sum(weight for _, weight in passes)
+    fused: dict[tuple[int, int, str], float] = {}
+    for score_map, weight in passes:
+        for key, score in score_map.items():
+            fused[key] = fused.get(key, 0.0) + weight * score
+    if total_weight <= 0:
+        return {}
+    return {key: value / total_weight for key, value in fused.items()}
 
-    # Detect whether the board must be rotated 180 degrees so White is at the bottom.
-    white_bottom = sum(d["score"] for d in best.values() if d["label"] in WHITE_NAMES and d["row"] >= 4)
-    white_bottom += sum(d["score"] for d in best.values() if d["label"] in BLACK_NAMES and d["row"] < 4)
-    white_top = sum(d["score"] for d in best.values() if d["label"] in WHITE_NAMES and d["row"] < 4)
-    white_top += sum(d["score"] for d in best.values() if d["label"] in BLACK_NAMES and d["row"] >= 4)
-    flipped_180 = white_top > white_bottom
-    if flipped_180:
-        rectified = cv2.rotate(rectified, cv2.ROTATE_180)
-        best = {(7 - row, 7 - col): {**det, "row": 7 - row, "col": 7 - col,
-                                    "xy": (BOARD_SIZE - 1 - det["xy"][0], BOARD_SIZE - 1 - det["xy"][1])}
-                for (row, col), det in best.items()}
 
+def _grid_from_scores(scores: dict[tuple[int, int, str], float]):
+    """Choose the highest weighted/fused model score on each square.
+
+    Deliberately no chess-material cap is applied here. A photograph may show a
+    promoted piece, a captured-piece set, or an unusual legal position; image-model
+    scores must not be silently overwritten by an assumed starting-piece inventory.
+    """
     grid = [["." for _ in range(8)] for _ in range(8)]
+    best_score = [[0.0 for _ in range(8)] for _ in range(8)]
+    candidates: dict[tuple[int, int], dict[str, float]] = {}
+    for (row, col, letter), score in scores.items():
+        score = float(score)
+        if score >= CANDIDATE_FLOOR:
+            candidates.setdefault((row, col), {})[letter] = score
+        if score >= POSITION_THRESHOLD and score > best_score[row][col]:
+            best_score[row][col] = score
+            grid[row][col] = letter
+    return grid, candidates
+
+
+def _top_prediction_per_square(scores: dict[tuple[int, int, str], float]):
+    """Top class and score for each occupied square in one detector view."""
+    result: dict[tuple[int, int], tuple[str, float]] = {}
+    for (row, col, letter), score in scores.items():
+        key = (row, col)
+        old = result.get(key)
+        if old is None or float(score) > old[1]:
+            result[key] = (letter, float(score))
+    return result
+
+
+def _square_luminance(image_bgr: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+    samples = np.zeros((8, 8), dtype=np.float32)
+    # Sample the interior 50% of each square, avoiding borders and piece bases.
+    offsets = (0.30, 0.50, 0.70)
+    size = BOARD_SIZE / 8.0
+    for row in range(8):
+        for col in range(8):
+            values = []
+            for dy in offsets:
+                for dx in offsets:
+                    x = int(np.clip((col + dx) * size, 0, BOARD_SIZE - 1))
+                    y = int(np.clip((row + dy) * size, 0, BOARD_SIZE - 1))
+                    values.append(float(gray[y, x]))
+            samples[row, col] = float(np.mean(values))
+    return samples
+
+
+def _orientation_evidence(grid: list[list[str]], luminance: np.ndarray):
+    """Resolve 90-degree ambiguity with square parity and 180-degree with pawns."""
+    candidates = []
+    for turns in range(4):
+        rotated_grid = np.rot90(np.asarray(grid), turns).tolist()
+        rotated_lum = np.rot90(luminance, turns)
+        ranks, files = np.indices((8, 8))
+        even = (ranks + files) % 2 == 0
+        colour = float(rotated_lum[even].mean() - rotated_lum[~even].mean())
+        near = far = 0
+        total_pawns = own_pawns = 0
+        white_seen = black_seen = False
+        for r in range(8):
+            for c in range(8):
+                piece = rotated_grid[r][c]
+                if piece == ".":
+                    continue
+                bottom = r >= 4
+                if piece.isupper():
+                    near += int(bottom); far += int(not bottom)
+                else:
+                    near += int(not bottom); far += int(bottom)
+                if piece == "P":
+                    white_seen = True; total_pawns += 1; own_pawns += int(bottom)
+                elif piece == "p":
+                    black_seen = True; total_pawns += 1; own_pawns += int(not bottom)
+        total_pieces = near + far
+        pieces_score = (near - far) / total_pieces if total_pieces else 0.0
+        pawns_score = ((2 * own_pawns - total_pawns) / total_pawns
+                       if total_pawns and white_seen and black_seen else 0.0)
+        candidates.append((turns, colour, pieces_score + 2.0 * pawns_score, pieces_score, pawns_score))
+    best_colour = max(item[1] for item in candidates)
+    survivors = [item for item in candidates if item[1] >= best_colour - 0.02]
+    chosen = max(survivors, key=lambda item: item[2])
+    runner_up = max((item[2] for item in survivors if item[0] != chosen[0]), default=None)
+    evidence = {
+        "square_colour": chosen[1], "piece_position": chosen[3], "pawn_position": chosen[4],
+        "orientation_margin": 0.0 if runner_up is None else chosen[2] - runner_up,
+        "orientation_candidates": len(survivors),
+    }
+    return int(chosen[0]), evidence
+
+
+def _rotate_square(row: int, col: int, turns: int) -> tuple[int, int]:
+    if turns == 0:
+        return row, col
+    if turns == 1:
+        return 7 - col, row
+    if turns == 2:
+        return 7 - row, 7 - col
+    return col, 7 - row
+
+
+def _rotate_point(x: float, y: float, turns: int) -> tuple[float, float]:
+    if turns == 0:
+        return x, y
+    if turns == 1:
+        return y, BOARD_SIZE - 1 - x
+    if turns == 2:
+        return BOARD_SIZE - 1 - x, BOARD_SIZE - 1 - y
+    return BOARD_SIZE - 1 - y, x
+
+
+def run_recognition(image_bgr: np.ndarray):
+    """ChessSight's three-pass reading recipe: full frame, board crop, mirrored crop.
+
+    Uses calibrated detector scores, contact-point anchoring, weighted three-view
+    fusion and image-based orientation. The highest fused model score is preserved;
+    chess-material assumptions never rewrite a visual prediction.
+    """
+    height, width = image_bgr.shape[:2]
+    original_all, original_pieces = detect_cached(image_bgr)
+    corners, corner_method = detect_board_corners(image_bgr, original_all)
+
+    destination = np.array(
+        [[0, 0], [BOARD_SIZE - 1, 0], [BOARD_SIZE - 1, BOARD_SIZE - 1], [0, BOARD_SIZE - 1]],
+        dtype=np.float32,
+    )
+    image_to_board = cv2.getPerspectiveTransform(order_corners(corners), destination)
+    if not np.isfinite(image_to_board).all():
+        raise RuntimeError("A sakktábla perspektívakorrekciója nem sikerült.")
+    rectified = cv2.warpPerspective(
+        image_bgr, image_to_board, (BOARD_SIZE, BOARD_SIZE), flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+
+    # Pass 1: original photo. Passes 2/3: square crop with room for tall pieces,
+    # and its horizontal mirror. Mirroring creates a genuinely different model view;
+    # sharpening the same rectified pixels is not an equivalent independent pass.
+    left, top, side = _board_crop(corners, width, height)
+    crop = image_bgr[top:top + side, left:left + side]
+    if crop.size == 0 or crop.shape[0] != crop.shape[1]:
+        raise RuntimeError("Nem sikerült négyzetes kivágást készíteni a sakktábláról.")
+    mirrored_crop = cv2.flip(crop, 1)
+    crop_all, _ = detect_cached(crop)
+    mirror_all, _ = detect_cached(mirrored_crop)
+
+    original_scores = _square_scores(original_all, image_to_board)
+    crop_scores = _square_scores(crop_all, image_to_board, offset_x=left, offset_y=top)
+    mirror_scores = _square_scores(
+        mirror_all, image_to_board, offset_x=left, offset_y=top, mirror_side=float(side)
+    )
+    full_weight = (side / float(min(width, height))) ** 2
+    fused_scores = _fuse_square_scores([
+        (original_scores, full_weight), (crop_scores, 1.0), (mirror_scores, 1.0)
+    ])
+
+    # Keep the best model-proposed class on every square. No material correction:
+    # promotions and arbitrary mid-game positions make starting-material caps unsafe.
+    grid, candidates = _grid_from_scores(fused_scores)
+    per_view_maps = [
+        _top_prediction_per_square(original_scores),
+        _top_prediction_per_square(crop_scores),
+        _top_prediction_per_square(mirror_scores),
+    ]
+
+    # Resolve board rotation using the checkerboard's light/dark parity first,
+    # then piece placement and pawn direction for the remaining 180-degree tie.
+    turns, orientation_info = _orientation_evidence(grid, _square_luminance(rectified))
+    grid = np.rot90(np.asarray(grid), turns).tolist()
+    rectified = np.rot90(rectified, turns).copy()
+    # Re-map candidate and confidence information to the chosen orientation.
+    oriented_candidates: dict[tuple[int, int], dict[str, float]] = {}
+    for (row, col), class_scores in candidates.items():
+        new_key = _rotate_square(row, col, turns)
+        oriented_candidates[new_key] = class_scores
+
+    oriented_view_maps: list[dict[tuple[int, int], tuple[str, float]]] = []
+    for view_map in per_view_maps:
+        rotated_view: dict[tuple[int, int], tuple[str, float]] = {}
+        for (row, col), prediction in view_map.items():
+            rotated_view[_rotate_square(row, col, turns)] = prediction
+        oriented_view_maps.append(rotated_view)
+
     annotated = rectified.copy()
+    square_size = BOARD_SIZE / 8.0
     for i in range(9):
-        p = min(BOARD_SIZE - 1, int(round(i * size)))
-        cv2.line(annotated, (p, 0), (p, BOARD_SIZE - 1), (255, 220, 0), 1, cv2.LINE_AA)
-        cv2.line(annotated, (0, p), (BOARD_SIZE - 1, p), (255, 220, 0), 1, cv2.LINE_AA)
-    for (row, col), det in best.items():
-        piece = FEN_MAP[det["label"]]
-        grid[row][col] = piece
-        x, y = [int(round(v)) for v in det["xy"]]
-        color = (30, 210, 30) if piece.isupper() else (255, 150, 20)
-        square = f"{chr(97 + col)}{8 - row}"
-        cv2.circle(annotated, (x, y), 7, color, -1, cv2.LINE_AA)
-        cv2.putText(annotated, f"{piece} {square} {det['score']:.2f}",
-                    (min(BOARD_SIZE - 150, x + 7), max(18, y - 6)), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.44, color, 2, cv2.LINE_AA)
+        point = min(BOARD_SIZE - 1, int(round(i * square_size)))
+        cv2.line(annotated, (point, 0), (point, BOARD_SIZE - 1), (255, 220, 0), 1, cv2.LINE_AA)
+        cv2.line(annotated, (0, point), (BOARD_SIZE - 1, point), (255, 220, 0), 1, cv2.LINE_AA)
+
+    uncertain_details = []
+    uncertain_keys = set()
+    for row in range(8):
+        for col in range(8):
+            piece = grid[row][col]
+            if piece == ".":
+                continue
+            class_scores = oriented_candidates.get((row, col), {})
+            ranked = sorted(class_scores.items(), key=lambda item: item[1], reverse=True)
+            top_score = ranked[0][1] if ranked else 0.0
+            selected_score = class_scores.get(piece, 0.0)
+            second_piece, second_score = ranked[1] if len(ranked) > 1 else ("—", 0.0)
+            view_predictions = [view.get((row, col)) for view in oriented_view_maps]
+            view_labels = [item[0] if item and item[1] >= POSITION_THRESHOLD else "—"
+                           for item in view_predictions]
+            view_agreement = sum(label == piece for label in view_labels)
+            view_summary = []
+            for view_name, prediction in zip(("Teljes kép", "Nagyított kép", "Tükrözött kép"), view_predictions):
+                if prediction and prediction[1] >= POSITION_THRESHOLD:
+                    view_summary.append(f"{view_name}: {prediction[0]} ({prediction[1]:.2f})")
+                else:
+                    view_summary.append(f"{view_name}: nincs találat")
+            # Highlight low margin, low confidence, or disagreement between views.
+            is_uncertain = (
+                top_score - second_score < 0.07
+                or selected_score < 0.20
+                or view_agreement < 2
+            )
+            if is_uncertain:
+                uncertain_keys.add((row, col))
+                uncertain_details.append({
+                    "Mező": f"{chr(97 + col)}{8 - row}",
+                    "Kiválasztott bábu": piece,
+                    "Összesített pont": round(selected_score, 3),
+                    "Második tipp": second_piece,
+                    "Második pont": round(second_score, 3),
+                    "Nézetegyezés": f"{view_agreement}/3",
+                    "Nézetenkénti tippek": " | ".join(view_summary),
+                })
+            x = int(round((col + 0.5) * square_size))
+            y = int(round((row + FOOT_Y) * square_size))
+            colour = (0, 190, 0) if piece.isupper() else (255, 130, 10)
+            cv2.circle(annotated, (x, y), 6, colour, -1, cv2.LINE_AA)
+            caption = f"{piece} {chr(97 + col)}{8 - row} {selected_score:.2f}"
+            cv2.putText(annotated, caption, (min(BOARD_SIZE - 150, x + 7), max(18, y - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(annotated, caption, (min(BOARD_SIZE - 150, x + 7), max(18, y - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, colour, 1, cv2.LINE_AA)
+            if (row, col) in uncertain_keys:
+                cv2.circle(annotated, (x, y), 14, (0, 220, 255), 3, cv2.LINE_AA)
 
     fen = make_fen(grid)
-    chess_board = chess.Board(fen)
-    original_annotated = draw_original(image_bgr, corners, all_dets)
+    board_obj = chess.Board(fen)
+    original_annotated = draw_original(image_bgr, corners, original_pieces)
+    occupied = [piece for row in grid for piece in row if piece != "."]
     metrics = {
         "corner_method": corner_method,
-        "piece_detections": len(piece_dets),
-        "occupied_squares": len(best),
-        "flipped_180": flipped_180,
-        "fen_valid": chess_board.is_valid(),
+        "piece_detections": sum(d["label"] in FEN_MAP for d in original_all)
+                            + sum(d["label"] in FEN_MAP for d in crop_all)
+                            + sum(d["label"] in FEN_MAP for d in mirror_all),
+        "occupied_squares": len(occupied),
+        "uncertain_squares": len(uncertain_keys),
+        "orientation_turns": turns,
+        "orientation_info": orientation_info,
+        "fen_valid": board_obj.is_valid(),
         "grid": grid,
-        "confidence_mean": float(np.mean([d["score"] for d in best.values()])) if best else 0.0,
+        "confidence_mean": float(np.mean([oriented_candidates.get((r, c), {}).get(grid[r][c], 0.0)
+                                           for r in range(8) for c in range(8) if grid[r][c] != "."]))
+                            if occupied else 0.0,
+        "view_agreement_mean": float(np.mean([
+            sum((view.get((r, c), ("—", 0.0))[0] == grid[r][c])
+                and view.get((r, c), ("—", 0.0))[1] >= POSITION_THRESHOLD
+                for view in oriented_view_maps)
+            for r in range(8) for c in range(8) if grid[r][c] != "."
+        ])) if occupied else 0.0,
+        "uncertain_details": uncertain_details,
+        "views_used": 3,
+        "full_frame_weight": full_weight,
+        "classifier_name": "ChessSight RT-DETR v0.2.0; official three-pass fusion recipe",
     }
     return original_annotated, annotated, fen, metrics
 
 
+PIPELINE_REVISION = "2026-11-09-chesssight-threepass-no-material-override-v7"
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def cached_full_recognition(image_bytes: bytes, pipeline_revision: str):
+    """Cache the complete result for the exact same uploaded file, including corner geometry."""
+    image_bgr = cv2.imdecode(np.frombuffer(image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if image_bgr is None:
+        raise RuntimeError("Nem sikerült beolvasni a feltöltött képet.")
+    return run_recognition(image_bgr)
+
+
 st.title("♟️ Automatikus sakkállás-felismerő")
 st.write(
-    "Tölts fel egy fényképet a fizikai sakktábláról. A program kézi kijelölés nélkül keresi a rácsot/sarkokat, "
-    "majd egy újabb, előre betanított modell osztályozza a bábukat és FEN-kódot készít."
+    "Tölts fel egy fényképet a fizikai sakktábláról. A program automatikusan megtalálja a négy sarkot, "
+    "majd három, egymást kiegészítő képi nézetből olvassa le a pozíciót."
 )
-st.caption("ChessSight RT-DETR v0.2.0 + automatikus OpenCV-rácsdetektálás. Első indításkor az új modell letöltődik a Hugging Face gyorsítótárába.")
-st.warning("Oktatási prototípus: a ChessSight modell CC BY-NC 4.0 licencű, nem kereskedelmi használatra. A modell szintetikus adatokon tanult; valós fényképeken a felismerést ellenőrizni kell.")
+st.caption("ChessSight RT-DETR v0.2.0 + Swin sarokmodell. Három nézet súlyozott pontszám-fúziója. A végső mezőcímkét mindig a legmagasabb összesített modellpontszám adja; sakkanyag-korlát nem írhatja felül a felismerést.")
+st.warning("Oktatási prototípus: a ChessSight detector és corner modell CC BY-NC 4.0 licencű, nem kereskedelmi használatra. Saját fényképeken az eredményt ellenőrizni kell.")
 
 uploaded = st.file_uploader("Sakktábla-fotó feltöltése", type=["jpg", "jpeg", "png", "webp", "bmp"])
 run_button = st.button("Automatikus felismerés", type="primary", disabled=uploaded is None)
@@ -559,16 +930,16 @@ if run_button and uploaded is not None:
     image_bgr = cv2.imdecode(image_bytes, cv2.IMREAD_COLOR)
     status = st.status("A modell betöltése és a felismerés fut…", expanded=True)
     try:
-        status.write("ChessSight pretrained modell betöltése (első alkalommal internetről letöltődik)…")
-        processor, model, device = load_chesssight_model()
-        status.write("Sakktábla-rács keresése és bábufelismerés…")
+        status.write("ChessSight RT-DETR bábufelismerő betöltése…")
+        status.write("ChessSight Swin sarokmodell betöltése (első alkalommal kb. 111 MB)…")
+        status.write("Automatikus sarokkeresés, perspektívakorrekció és háromnézetes bábufelismerés…")
         with st.spinner("Automatikus felismerés folyamatban…"):
-            original_annotated, board_annotated, fen, metrics = run_recognition(image_bgr, processor, model, device)
+            original_annotated, board_annotated, fen, metrics = cached_full_recognition(uploaded.getvalue(), PIPELINE_REVISION)
         status.update(label="Felismerés befejezve", state="complete", expanded=False)
 
         left, right = st.columns(2)
         with left:
-            st.subheader("Detektálás az eredeti képen")
+            st.subheader("Automatikusan megtalált tábla az eredeti képen")
             st.image(cv2.cvtColor(original_annotated, cv2.COLOR_BGR2RGB), use_container_width=True)
         with right:
             st.subheader("Kiegyenesített digitális tábla")
@@ -577,16 +948,31 @@ if run_button and uploaded is not None:
         st.subheader("FEN-kód")
         st.code(fen, language="text")
         st.download_button("FEN letöltése", data=fen + "\n", file_name="position.fen", mime="text/plain")
-        cols = st.columns(5)
+        cols = st.columns(6)
         cols[0].metric("Elfoglalt mezők", f"{metrics['occupied_squares']} / 64")
-        cols[1].metric("Modell találatai", metrics["piece_detections"])
+        cols[1].metric("Bábujelöltek a 3 nézetben", metrics["piece_detections"])
         cols[2].metric("Átlagos bizalom", f"{metrics['confidence_mean']:.2f}")
-        cols[3].metric("FEN szabályossága", "Érvényes" if metrics["fen_valid"] else "Ellenőrzendő")
-        cols[4].metric("180° forgatás", "Igen" if metrics["flipped_180"] else "Nem")
-        st.caption(f"Sarokdetektálási módszer: {metrics['corner_method']}")
+        cols[3].metric("Bizonytalan mezők", metrics["uncertain_squares"])
+        cols[4].metric("FEN szabályossága", "Érvényes" if metrics["fen_valid"] else "Ellenőrzendő")
+        cols[5].metric("Tájolás", f"{metrics['orientation_turns'] * 90}°")
+        st.caption(f"Sarokdetektálási módszer: {metrics['corner_method']} · teljes fotó súlya: {metrics['full_frame_weight']:.2f}")
+        st.caption(
+            "Tájolási bizonyíték – mezőszín: "
+            f"{metrics['orientation_info']['square_colour']:.3f}, "
+            f"bábuelhelyezkedés: {metrics['orientation_info']['piece_position']:.3f}, "
+            f"gyalogok: {metrics['orientation_info']['pawn_position']:.3f}."
+        )
+        st.caption(
+            f"Három nézet átlagos egyezése: {metrics['view_agreement_mean']:.2f}/3. "
+            "A mező címkéjét kizárólag a három nézet súlyozott modellpontszáma határozza meg; "
+            "sakkanyag-alapú címkecsere nincs."
+        )
         st.subheader("Felismerési rács")
         for row in metrics["grid"]:
             st.code(" ".join(row), language="text")
+        if metrics["uncertain_squares"]:
+            st.warning("A sárga karikás mezőkön kicsi az első és második osztálypontszám különbsége, alacsony az összesített bizalom, vagy a három képi nézet nem ért egyet. A táblázat megmutatja mindhárom nézet külön tippjét.")
+            st.dataframe(metrics["uncertain_details"], use_container_width=True, hide_index=True)
         if metrics["occupied_squares"] < 12:
             st.warning("Kevés bábu került a digitális táblára. Ellenőrizd a sarokdetektálást és próbálj élesebb, teljes táblás fotót.")
         if not metrics["fen_valid"]:
@@ -602,10 +988,10 @@ if run_button and uploaded is not None:
 
 with st.expander("Modellek, módszer és korlátok"):
     st.markdown(
-        "- **Bábufelismerés:** [ChessSight RT-DETR v0.2.0 modellkártya](https://huggingface.co/tchauffi/chesssight-rtdetr-v0.2.0). "
-        "A modellkártya 306 valós fotóból álló ChessReD teszthalmazon 71,24% teljes állás-pontosságot közöl, de a kis bábuk felismerése nehezebb.\n"
-        "- **Sarokkeresés:** először OpenCV sakkrács-illesztés (részleges 7×N mintákból a teljes 8×8-as tábla extrapolálása), "
-        "utána a detektor sarokjavaslatai, végül a régi photochess pose modell.\n"
-        "- **Régi `detector.py` és `chess_board.py`:** ezekhez nem nyúlunk; az új `app.py` önálló pipeline.\n"
-        "- **Licenc:** a ChessSight súlyai CC BY-NC 4.0 licencűek; kereskedelmi felhasználásra más megoldás szükséges."
+        "- **Elsődleges bábufelismerő:** [ChessSight RT-DETR v0.2.0](https://huggingface.co/tchauffi/chesssight-rtdetr-v0.2.0). "
+        "A három nézet súlyozott pontszámait egyesítjük. A jelenlegi alkalmazás szándékosan nem alkalmaz sakkanyag-korlátot, mert az felülírhatja a képi modell magasabb pontszámú döntését, és promóciós vagy szokatlan állásoknál hibát okozhat.\n"
+        "- **Sarokkeresés:** [ChessSight Swin corner heatmap v1](https://huggingface.co/tchauffi/chesssight-corner-heatmap-v1), automatikus 4 pont; OpenCV és photochess tartalék eljárással.\n"
+        "- **Döntés:** ChessSight RT-DETR pontszámok súlyozott fúziója három nézetből (teljes kép, négyzetes board crop, tükrözött crop), `FOOT_Y=0.96` bábu-talppont. Minden mezőn a legmagasabb összesített modellpontszám nyer; nincs sakkanyag-alapú címkecsere. A bizonytalan mezők táblázata nézetenként megmutatja a modell tippjét.\n"
+        "- **Régi `detector.py` és `chess_board.py`:** nem szükséges módosítani őket.\n"
+        "- **Licenc:** mindkét ChessSight modell CC BY-NC 4.0; kereskedelmi felhasználásra nem használhatók."
     )
